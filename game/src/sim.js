@@ -7,9 +7,9 @@
 // attackers win by elimination or by detonation. Money pays for the buy
 // menu; a kill pays $300, a round win $3,250, a loss $1,900.
 import * as THREE from 'three';
-import { SITE, SPAWNS } from './world.js';
-import { createBot, stepBot } from './bots.js';
-import { WEAPONS, GRENADES, ARMOUR_PRICE, ARMOUR_VALUE } from './weapons.js';
+import { SITE, SPAWNS, WAYPOINTS } from './world.js';
+import { createBot, stepBot, buyBot, findPath } from './bots.js';
+import { WEAPONS, GRENADES, ARMOUR_PRICE, ARMOUR_VALUE, chooseLoadout } from './weapons.js';
 
 const BUY_SECONDS = 15;
 const ROUND_SECONDS = 100;
@@ -21,7 +21,6 @@ const MAX_ROUNDS = 9;
 const KILL_REWARD = 300;
 const WIN_REWARD = 3250;
 const LOSS_REWARD = 1900;
-const BOT_DAMAGE = 20;
 
 export function createSim({ scene, world, player, arsenal, effects, audio, hud, camera }) {
   const raycaster = new THREE.Raycaster();
@@ -42,6 +41,11 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     prevFiring: false,
     lastBeepSecond: -1,
     deadShown: false,
+    auto: false, // autoplay: the player is driven by autoDrive, for headless balance tests
+    roundWinners: [],
+    roundReasons: [],
+    autoBought: false,
+    autoNades: {},
   };
 
   const owned = {
@@ -70,6 +74,9 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
 
   const botHandles = [];
   const botByFighter = new Map();
+  // Shot counters for balance tuning: how many shots the bots and the
+  // player fire, and how many of them land. Read via sim.debug.
+  const debug = { botShots: 0, botHits: 0, playerShots: 0, playerHits: 0, killsBy: {}, auto: { keys: [], target: null, path: [] } };
   SPAWNS.vanguard.slice(1).forEach((spawn, i) => {
     const h = createBot(scene, 'vanguard', i, spawn, world.colliders);
     botHandles.push(h);
@@ -161,12 +168,15 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
       if (killed && state.bomb.holder === fighter) dropBombAt(fighter.position);
     }
     if (killed) {
-      hud.killfeed(attacker.name, fighter.name, attacker.isPlayer ? arsenal.def().name : 'VK-47', part === 'head');
+      debug.killsBy[attacker.name] = (debug.killsBy[attacker.name] ?? 0) + 1;
+      hud.killfeed(attacker.name, fighter.name, attacker.isPlayer ? arsenal.def().name : (WEAPONS[attacker.weapon]?.name ?? 'VK-47'), part === 'head');
       if (attacker.isPlayer) {
         state.money += KILL_REWARD;
         state.kills += 1;
         hud.setMoney(state.money);
         audio.kill();
+      } else if (attacker.money !== undefined) {
+        attacker.money += KILL_REWARD; // a bot's kill pays its own purse
       }
       checkRoundEnd();
     }
@@ -185,8 +195,11 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     state.phase = 'roundEnd';
     state.timer = 4;
     state.wins[winner] += 1;
+    state.roundWinners.push(winner);
+    state.roundReasons.push(reason);
     const playerWon = winner === 'vanguard';
     state.money += playerWon ? WIN_REWARD : LOSS_REWARD;
+    for (const h of botHandles) h.bot.money += h.bot.team === winner ? WIN_REWARD : LOSS_REWARD;
     hud.setMoney(state.money);
     hud.setScore(state.wins.vanguard, state.wins.ember);
     hud.banner(`Round ${state.round} — ${playerWon ? 'Vanguard' : 'Ember'} wins`, reason);
@@ -198,6 +211,18 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     state.phase = 'matchEnd';
     const win = state.wins.vanguard > state.wins.ember;
     hud.showOverlay('end', { win, v: state.wins.vanguard, e: state.wins.ember });
+    if (state.auto) {
+      // headless balance runs read this from the page
+      window.__autoResult = {
+        wins: { ...state.wins },
+        rounds: state.roundWinners.slice(),
+        reasons: state.roundReasons.slice(),
+        kills: state.kills,
+        deaths: state.deaths,
+        money: state.money,
+        killsBy: { ...debug.killsBy },
+      };
+    }
   }
 
   function resetFighters() {
@@ -218,7 +243,11 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     state.bomb.channel = 0;
     state.bomb.dropPos = null;
     state.lastBeepSecond = -1;
+    state.autoBought = false;
+    state.autoNades = {};
+    auto.path = [];
     resetFighters();
+    for (const h of botHandles) buyBot(h.bot); // the bots shop with their own money
     hud.setScore(state.wins.vanguard, state.wins.ember);
     hud.setMoney(state.money);
     hud.setObjective('Buy phase — press B to shop');
@@ -241,6 +270,15 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     state.money = 800;
     state.kills = 0;
     state.deaths = 0;
+    state.roundWinners = [];
+    state.roundReasons = [];
+    state.autoBought = false;
+    state.autoNades = {};
+    for (const h of botHandles) {
+      h.bot.money = 800;
+      h.bot.weapon = 'pistol';
+      h.bot.weaponDamage = WEAPONS.pistol.damage;
+    }
     owned.weapons = new Set(['pistol']);
     owned.grenades = {};
     owned.armour = 0;
@@ -250,6 +288,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
   }
 
   function botShoot(bot, target, error, aimY) {
+    debug.botShots += 1;
     tmpOrigin.set(bot.position.x, bot.position.y + 1.5, bot.position.z);
     tmpPoint.set(
       target.position.x + (Math.random() * 2 - 1) * error * 20,
@@ -264,7 +303,8 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     if (hit && hit.fighter) {
       effects.tracer(tmpPoint, hit.point);
       const falloff = Math.max(0.4, 1 - dist / 80);
-      damage(hit.fighter, BOT_DAMAGE * falloff, hit.part, bot);
+      debug.botHits += 1;
+      damage(hit.fighter, bot.weaponDamage * falloff, hit.part, bot);
     } else if (hit) {
       effects.tracer(tmpPoint, hit.point);
       effects.impact(hit.point);
@@ -272,7 +312,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
       effects.tracer(tmpPoint, tmpOrigin.clone().addScaledVector(tmpDir, 60));
     }
     audio.shot('rifle', dist);
-    noise(bot.position, 18);
+    noise(bot.position, 30);
   }
 
   function playerShoot() {
@@ -282,6 +322,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
       audio.dryFire();
       return;
     }
+    debug.playerShots += pellets;
     camera.getWorldDirection(tmpDir);
     const speed = player.groundSpeed();
     const spread = arsenal.spread(speed, speed > 0.5, player.state.aiming, player.state.crouching);
@@ -296,6 +337,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
       const muzzle = muzzleWorld(muzzleVec);
       if (hit && hit.fighter) {
         effects.tracer(muzzle, hit.point);
+        debug.playerHits += 1;
         damage(hit.fighter, def.damage, hit.part, playerFighter);
         hud.hitmarker(!hit.fighter.alive);
         audio.hit();
@@ -309,7 +351,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     }
     player.recoil(def.recoil + Math.random() * 0.004, (Math.random() * 2 - 1) * 0.004);
     audio.shot(def.id);
-    noise(player.state.position, 18);
+    noise(player.state.position, 30);
     hud.setAmmo(arsenal.state.mag, arsenal.state.reserve, false);
   }
 
@@ -323,7 +365,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
         const d = Math.hypot(f.position.x - g.pos.x, f.position.z - g.pos.z)
           + Math.abs(f.position.y - g.pos.y) * 0.5;
         if (d < def.radius) {
-          damage(f, def.damage * (1 - d / def.radius) + 20, 'body', playerFighter);
+          damage(f, def.damage * (1 - d / def.radius) + 20, 'body', g.by ?? playerFighter);
         }
       }
       noise(g.pos, 25);
@@ -391,6 +433,20 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
       return player.groundSpeed();
     },
     botShoot,
+    // A bot's throw: lobs the grenade toward `target` with a small arc so
+    // the fuse lands it near the target, and spends the bot's grenade.
+    throwGrenade(bot, type, target) {
+      const origin = new THREE.Vector3(bot.position.x, bot.position.y + 1.4, bot.position.z);
+      const dir = new THREE.Vector3(target.x - origin.x, 0, target.z - origin.z);
+      const dist = dir.length() || 1;
+      dir.normalize();
+      dir.y = Math.min(0.55, 2.2 / Math.max(6, dist));
+      dir.normalize();
+      arsenal.throwAny(type, origin, dir, bot);
+      bot.grenades[type] -= 1;
+      bot.grenadeCooldown = 10;
+      audio.click();
+    },
     plantDone(bot) {
       state.bomb.planted = true;
       state.bomb.fuse = BOMB_FUSE;
@@ -407,6 +463,106 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     },
   };
 
+  // --- autoplay: a stand-in human, for headless balance tests only
+  // (?autoplay=1). It buys the best loadout it can afford, pushes the site
+  // along the waypoint graph, plants when it gets there, and shoots the
+  // nearest visible enemy with a strafing aim — good enough to measure
+  // whether Vanguard or Ember wins the economy, not a showcase of skill.
+  function angleDiff(a, b) {
+    let d = a - b;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  function turnToward(cur, want, maxStep) {
+    const d = angleDiff(want, cur);
+    if (Math.abs(d) <= maxStep) return want;
+    return cur + Math.sign(d) * maxStep;
+  }
+
+  const auto = { strafeDir: 1, strafeTimer: 0, path: [] };
+
+  function autoDrive(dt, input) {
+    const keys = input.state.keys;
+    keys.clear();
+    input.state.firing = false;
+    debug.auto.keys = [];
+    debug.auto.target = null;
+    debug.auto.path = auto.path.slice();
+    if (!player.state.alive) return;
+    // nearest visible enemy, inside the same 26 m a bot will fight at:
+    // further out the autopilot pushes the site instead of sniping
+    let target = null;
+    let td = Infinity;
+    for (const f of fighters) {
+      if (!f.alive || f.team === 'vanguard') continue;
+      const d = Math.hypot(f.position.x - player.state.position.x, f.position.z - player.state.position.z);
+      if (d < td && d < 26 && lineOfSight(player.state.position, f.position)) { target = f; td = d; }
+    }
+    if (target) {
+      debug.auto.target = target.name;
+      const dx = target.position.x - player.state.position.x;
+      const dz = target.position.z - player.state.position.z;
+      const wantYaw = Math.atan2(-dx, -dz);
+      player.state.yaw = turnToward(player.state.yaw, wantYaw, dt * 6);
+      const dy = (target.position.y + 1.35) - (player.state.position.y + player.state.eye);
+      const wantPitch = Math.asin(Math.max(-1, Math.min(1, dy / Math.max(1, td))));
+      player.state.pitch = turnToward(player.state.pitch, wantPitch, dt * 6);
+      if (td > 10 && td < 25 && !state.autoNades.flash && (owned.grenades.flash ?? 0) > 0) {
+        arsenal.selectGrenade('flash');
+        camera.getWorldDirection(tmpDir);
+        if (arsenal.throwGrenade(camera.position, tmpDir)) state.autoNades.flash = true;
+      }
+      if (Math.abs(angleDiff(wantYaw, player.state.yaw)) < 0.06) {
+        if (arsenal.state.mag === 0) arsenal.reload();
+        else input.state.firing = true;
+      }
+      auto.strafeTimer -= dt;
+      if (auto.strafeTimer <= 0) { auto.strafeDir = -auto.strafeDir; auto.strafeTimer = 0.7 + Math.random() * 0.5; }
+      if (td > 20) keys.add('KeyW');
+      keys.add(auto.strafeDir > 0 ? 'KeyD' : 'KeyA');
+      debug.auto.keys = [...keys];
+      return;
+    }
+    // no enemy: push the site along the waypoint graph, plant on arrival
+    if (auto.path.length === 0) auto.path = findPath(player.state.position, 6);
+    if (auto.path.length === 0) {
+      // already standing on the site node: hold here, plant if carrying
+      if (!state.bomb.planted && state.bomb.holder === 'player') {
+        const dSite = Math.hypot(player.state.position.x - SITE.x, player.state.position.z - SITE.z);
+        if (dSite < SITE.radius) keys.add('KeyE');
+      }
+      debug.auto.keys = [...keys];
+      return;
+    }
+    const [nx, nz] = WAYPOINTS.nodes[auto.path[0]];
+    const dx = nx - player.state.position.x;
+    const dz = nz - player.state.position.z;
+    if (Math.hypot(dx, dz) < 0.6) {
+      auto.path.shift();
+      return;
+    }
+    const wantYaw = Math.atan2(-dx, -dz);
+    player.state.yaw = turnToward(player.state.yaw, wantYaw, dt * 6);
+    if (Math.abs(angleDiff(wantYaw, player.state.yaw)) < 0.5) keys.add('KeyW');
+    if (!state.bomb.planted && state.bomb.holder === 'player') {
+      const dSite = Math.hypot(player.state.position.x - SITE.x, player.state.position.z - SITE.z);
+      if (dSite < SITE.radius) keys.add('KeyE');
+    }
+    debug.auto.keys = [...keys];
+  }
+
+  function autoBuy() {
+    const loadout = chooseLoadout(state.money, arsenal.state.weapon);
+    if (!owned.weapons.has(loadout.weapon)) buy('weapon', loadout.weapon);
+    if (loadout.armour) buy('armour', 'armour');
+    for (const [type, count] of Object.entries(loadout.grenades)) {
+      for (let i = 0; i < count; i += 1) buy('grenade', type);
+    }
+    arsenal.equip(loadout.weapon);
+  }
+
   function step(dt, input) {
     // hitbox meshes track the player every step
     playerHead.position.set(player.state.position.x, player.state.position.y + 1.55, player.state.position.z);
@@ -419,6 +575,10 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
 
     if (state.phase === 'buy') {
       state.timer -= dt;
+      if (state.auto && !state.autoBought) {
+        state.autoBought = true;
+        autoBuy();
+      }
       if (input.state.pressed.has('KeyB')) {
         if (hud.isBuyOpen()) hud.closeBuy();
         else hud.openBuy(state.money, owned);
@@ -481,6 +641,7 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     }
 
     // player movement (frozen while the buy menu is up is handled by phase)
+    if (state.auto) autoDrive(dt, input);
     if (player.state.alive) {
       player.step(dt, input.state.keys, input.state.aiming);
       const def = arsenal.def();
@@ -598,6 +759,24 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
       defuser.bot.channel = 0.45;
       const guard = botHandles[6];
       guard.bot.position.set(-12, 0, -6);
+      // the guard smokes the east approach as the defuser works the pump
+      guard.bot.grenades.smoke = 1;
+      ctx.throwGrenade(guard.bot, 'smoke', { x: -10, y: 0, z: -12 });
+      // the smoke itself is staged outright: the thrown grenade's fuse is
+      // 1.2 s, longer than the frame's settle, so a real throw would show
+      // no smoke yet. The guard's throw is still live (it pops behind
+      // the frame) and the cloud is the same effects.smoke it would make.
+      effects.smoke(new THREE.Vector3(-10, 1, -12), 14);
+      // the other defenders hold their posts, facing the site — and the
+      // player wears Kevlar for the shot, because a staged frame is no
+      // excuse for the bots to stop shooting during the settle
+      const holds = [[4, -14, -15], [7, 12, -12], [8, -6, -11]];
+      for (const [i, x, z] of holds) {
+        const h = botHandles[i];
+        h.bot.position.set(x, 0, z);
+        h.bot.yaw = Math.atan2(-(SITE.x - x), -(SITE.z - z));
+      }
+      player.state.armour = 100;
       hud.setScore(2, 1);
       hud.setMoney(2400);
       hud.setBomb('Charge blows in 18s');
@@ -678,14 +857,22 @@ export function createSim({ scene, world, player, arsenal, effects, audio, hud, 
     playerShoot();
   }
 
+  // Autoplay entry: the player is driven by autoDrive from here on.
+  function enableAutoplay() {
+    state.auto = true;
+    startMatch();
+  }
+
   return {
     state,
     owned,
+    debug,
     step,
     buy,
     startMatch,
     setupShot,
     debugFire,
+    enableAutoplay,
     fighters,
     playerFighter,
   };

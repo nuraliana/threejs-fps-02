@@ -17,14 +17,19 @@ const WALLS = [
   [0, 20, 57, 1, 4, 'concrete'],
   [-28, 0, 1, 41, 4, 'concrete'],
   [28, 0, 1, 41, 4, 'concrete'],
-  // Pump House: site A, a U open to the south-east around the pump
+  // Pump House: site A, a U open to the south-east around the pump. The
+  // south wall stops short of the east side on purpose: the gap between
+  // its east end and the site is the attackers' way in, and a wall across
+  // the whole south side would trap anyone routing to the site against it.
   [-23.5, -13, 1, 9, 3.6, 'concrete'],
   [-14.5, -17, 10, 1, 3.6, 'concrete'],
-  [-19, -8.5, 9, 1, 3.6, 'concrete'],
-  // mid: two stacked containers make the courtyard's spine
-  [-3.4, -2, 6.2, 2.6, 2.6, 'rust'],
-  [3.4, -2, 6.2, 2.6, 2.6, 'rust'],
-  [-3.4, -2, 6.2, 2.6, 2.6, 'rust', 2.6],
+  [-21.5, -8.5, 4, 1, 3.6, 'concrete'],
+  // mid: two stacked containers make the courtyard's spine. The gap
+  // between them is 1.0 m on purpose: a fighter is 0.68 m wide, so a
+  // narrower gap would wedge anyone routing straight down mid.
+  [-3.6, -2, 6.2, 2.6, 2.6, 'rust'],
+  [3.6, -2, 6.2, 2.6, 2.6, 'rust'],
+  [-3.6, -2, 6.2, 2.6, 2.6, 'rust', 2.6],
   // A Long cover
   [-22, 2, 2.4, 2.4, 1.3, 'concrete'],
   [-22, -6, 3.2, 1.2, 1.3, 'concrete'],
@@ -58,20 +63,26 @@ export const SPAWNS = {
 
 // Waypoint graph: [x, z] nodes, edges by index. Bots path with BFS over it.
 // Attackers push from the south; defenders hold the site and the lanes.
+// Every node is open ground a fighter can stand on, and every edge is a
+// straight line a fighter can walk or slide along — a node inside a box,
+// or an edge through a wall a fighter cannot slide around, strands the
+// bots against the wall forever (verified by harness/navcheck.py).
 export const WAYPOINTS = {
   nodes: [
     [0, 16], // 0 vanguard spawn
-    [-8, 12], // 1
+    [-8, 9], // 1 A entry, south of the (-8,12) block
     [8, 12], // 2
     [-16, 8], // 3 A entry
-    [-22, 2], // 4 A long
-    [-22, -6], // 5 A long north
-    [-18, -12], // 6 site A
-    [0, 6], // 7 mid south
+    [-19.5, 2], // 4 A long, east of the (-22,2) block
+    [-19.5, -6], // 5 A long north, east of the (-22,-6) block
+    [-17, -12], // 6 site A, east of the pump
+    [2, 6], // 7 mid south, east of the (0,9) block
     [0, 0], // 8 mid court
-    [0, -8], // 9 mid north
+    [-6, -11], // 9 site south-east hold: four defenders hold the site,
+    // one covers the east. A mid hold here left the site 3-vs-5 and the
+    // attackers won the first contact before help could rotate in.
     [16, 8], // 10 B entry
-    [24, 4], // 11 tunnel
+    [24, 12], // 11 tunnel south mouth (the tunnel is entered from the south)
     [24, -8], // 12 tunnel exit
     [-10, -12], // 13 site east
     [-14, -15], // 14 site west hold

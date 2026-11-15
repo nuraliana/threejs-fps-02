@@ -50,6 +50,27 @@ export const GRENADES = {
 export const ARMOUR_PRICE = 650;
 export const ARMOUR_VALUE = 100;
 
+// Bot loadout: what a bot buys with its money in the buy phase. Rifle
+// first, then SMG, then shotgun; Kevlar and grenades with what's left.
+// Guns are owned for the match, like the player's: `owned` is the gun the
+// bot already has, and it only pays for an upgrade over it.
+// The sniper is player-only: a bot that one-taps would wreck the balance.
+export function chooseLoadout(money, owned = 'pistol') {
+  const tiers = { pistol: 0, shotgun: 1, smg: 2, rifle: 3 };
+  const out = { weapon: owned, armour: false, grenades: {} };
+  let left = money;
+  const best = left >= WEAPONS.rifle.price + 300 ? 'rifle'
+    : left >= WEAPONS.smg.price + 300 ? 'smg'
+    : left >= WEAPONS.shotgun.price + 300 ? 'shotgun' : 'pistol';
+  if (tiers[best] > tiers[owned]) { out.weapon = best; left -= WEAPONS[best].price; }
+  if (left >= ARMOUR_PRICE + 300) { out.armour = true; left -= ARMOUR_PRICE; }
+  if (left >= GRENADES.flash.price + 300) { out.grenades.flash = 1; left -= GRENADES.flash.price; }
+  if (left >= GRENADES.smoke.price + 300) { out.grenades.smoke = 1; left -= GRENADES.smoke.price; }
+  if (left >= GRENADES.he.price) { out.grenades.he = 1; left -= GRENADES.he.price; }
+  out.spent = money - left;
+  return out;
+}
+
 const MUZZLE_TIME = 0.06;
 
 function buildViewModel(def) {
@@ -80,7 +101,7 @@ function buildViewModel(def) {
   return group;
 }
 
-export function createArsenal(camera) {
+export function createArsenal(camera, scene) {
   const flash = new THREE.Mesh(
     new THREE.PlaneGeometry(0.26, 0.26),
     new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.hazard), transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }),
@@ -122,7 +143,19 @@ export function createArsenal(camera) {
     grenades: { he: 0, smoke: 0, flash: 0 },
     selectedGrenade: null, // 'he' | 'smoke' | 'flash' when a grenade is in hand
   };
-  let thrown = []; // live grenade entities: { type, pos, vel, fuse }
+  let thrown = []; // live grenade entities: { type, pos, vel, fuse, by, mesh }
+
+  // A thrown grenade is a visible body, not just a fuse: one small sphere
+  // per live grenade, reused from a pool of six.
+  const grenadeGeo = new THREE.SphereGeometry(0.07, 10, 8);
+  const grenadeMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(0x2f4a2a), roughness: 0.5, metalness: 0.4 });
+  const grenadeMeshes = [];
+  for (let i = 0; i < 6; i += 1) {
+    const m = new THREE.Mesh(grenadeGeo, grenadeMat);
+    m.visible = false;
+    scene.add(m);
+    grenadeMeshes.push(m);
+  }
 
   function showModel() {
     for (const [id, model] of Object.entries(models)) model.visible = id === state.weapon && !state.selectedGrenade;
@@ -176,7 +209,11 @@ export function createArsenal(camera) {
         g.vel.x *= 0.7;
         g.vel.z *= 0.7;
       }
-      if (g.fuse <= 0) onEvent(g);
+      if (g.mesh) g.mesh.position.copy(g.pos);
+      if (g.fuse <= 0) {
+        if (g.mesh) { g.mesh.visible = false; g.mesh = null; }
+        onEvent(g);
+      }
     }
     thrown = thrown.filter((g) => g.fuse > 0);
   }
@@ -241,16 +278,27 @@ export function createArsenal(camera) {
       const type = state.selectedGrenade;
       if (!type || (state.grenades[type] ?? 0) <= 0) return null;
       state.grenades[type] -= 1;
-      thrown.push({
-        type,
-        pos: origin.clone(),
-        vel: direction.clone().multiplyScalar(13).add(new THREE.Vector3(0, 3.5, 0)),
-        fuse: GRENADES[type].fuse,
-      });
+      this.throwAny(type, origin, direction, null);
       if (state.grenades[type] === 0) {
         state.selectedGrenade = null;
         showModel();
       }
+      return type;
+    },
+    // A throw that is not the player's: bots throw through this, with the
+    // thrower attached so the killfeed can name them.
+    throwAny(type, origin, direction, by) {
+      const g = {
+        type,
+        pos: origin.clone(),
+        vel: direction.clone().multiplyScalar(13).add(new THREE.Vector3(0, 3.5, 0)),
+        fuse: GRENADES[type].fuse,
+        by: by ?? null,
+        mesh: null,
+      };
+      const free = grenadeMeshes.find((m) => !m.visible);
+      if (free) { g.mesh = free; free.visible = true; free.position.copy(g.pos); }
+      thrown.push(g);
       return type;
     },
     refill() {
@@ -263,6 +311,7 @@ export function createArsenal(camera) {
       state.kick = 0;
       state.bloom = 0;
       thrown = [];
+      for (const m of grenadeMeshes) m.visible = false;
     },
   };
 }

@@ -1,7 +1,10 @@
 // SANDLINE boot and the one loop: a fixed 60 Hz simulation feeding a
 // render at the display's rate. ?shot=cover|buy|site|win with &seed=N sets
 // up a deterministic frame for a capture, settles it, renders it twice,
-// then freezes it and sets window.__shotReady.
+// then freezes it and sets window.__shotReady. ?autoplay=1&seed=N starts a
+// headless match with the player driven by the sim's autopilot, for
+// balance tests: window.__ff(n) steps the sim n frames, and
+// window.__autoResult holds the match result when it ends.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 import { createWorld } from './world.js';
@@ -17,6 +20,7 @@ import { SPAWNS } from './world.js';
 const FIXED_STEP = 1 / 60;
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
+const autoplay = params.get('autoplay') === '1';
 const seed = Number.parseInt(params.get('seed') ?? '1', 10) || 1;
 
 function mulberry32(initial) {
@@ -30,7 +34,7 @@ function mulberry32(initial) {
   };
 }
 const random = mulberry32(seed);
-if (shot) Math.random = random; // deterministic captures only; live play stays random
+if (shot || autoplay) Math.random = random; // deterministic captures and autoplay runs only; live play stays random
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -50,7 +54,7 @@ const effects = createEffects(scene);
 const audio = createAudio();
 const hud = createHud();
 const player = createPlayer(world.colliders, SPAWNS.vanguard[0]);
-const arsenal = createArsenal(camera);
+const arsenal = createArsenal(camera, scene);
 const sim = createSim({ scene, world, player, arsenal, effects, audio, hud, camera });
 const input = createInput(renderer.domElement, onLockChange);
 
@@ -94,7 +98,7 @@ document.getElementById('play').addEventListener('click', () => {
 });
 
 function onLockChange(locked) {
-  if (shot) return;
+  if (shot || autoplay) return;
   if (locked) {
     hud.hideOverlay();
   } else if ((sim.state.phase === 'round' || sim.state.phase === 'buy') && player.state.alive) {
@@ -121,12 +125,35 @@ function menuCamera(dt) {
 }
 
 function step(dt) {
+  // The sim raycasts against the meshes' world matrices, and the renderer
+  // is the thing that normally refreshes them — so a headless run that
+  // steps without rendering would test every mesh at the origin. Refresh
+  // them here instead; in live play the renderer does the same work again
+  // for free at render time.
+  scene.updateMatrixWorld();
   if (sim.state.phase === 'round' || sim.state.phase === 'buy') {
     const look = input.takeLook();
     if (input.state.locked || shot) player.look(look.x, look.y);
   }
   sim.step(dt, input);
+  syncBots();
   input.endStep();
+}
+
+// The bots' meshes face where the bot faces, and their legs and arms
+// swing with their walk: the group turns with bot.yaw, the legs with
+// walkPhase, the arms from their ready poses.
+function syncBots() {
+  for (const f of sim.fighters) {
+    if (f.isPlayer || !f.limbs) continue;
+    const { legL, legR, armL, armR, armLBase, armRBase } = f.limbs;
+    f.group.rotation.y = f.yaw;
+    const swing = Math.sin(f.walkPhase) * 0.45;
+    legL.rotation.x = swing;
+    legR.rotation.x = -swing;
+    armL.rotation.x = armLBase - swing * 0.25;
+    armR.rotation.x = armRBase + swing * 0.25;
+  }
 }
 
 function frame(now) {
@@ -161,6 +188,8 @@ function settle(steps) {
 function runShot(name) {
   hud.hideOverlay();
   sim.setupShot(name);
+  // 30 steps (0.5 s) settles every shot: the site smoke is staged
+  // outright in setupShot, so no long fuse wait is needed.
   settle(30);
   // Fire one aimed round for combat shots (tracer + muzzle flash in frame);
   // re-show the win banner, which a slow software render can outlast.
@@ -192,8 +221,22 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-window.__game = { sim, player, arsenal, world };
+window.__game = { sim, player, arsenal, world, input };
+
+// Headless balance runs: step the sim by hand instead of the render loop.
+window.__ff = (n) => {
+  for (let i = 0; i < n; i += 1) {
+    if (sim.state.phase === 'matchEnd') break;
+    step(FIXED_STEP);
+    syncCamera();
+  }
+  return sim.state.phase;
+};
+window.__matchDone = () => sim.state.phase === 'matchEnd';
 
 syncCamera();
 if (shot) runShot(shot);
-else requestAnimationFrame(frame);
+else if (autoplay) {
+  hud.hideOverlay();
+  sim.enableAutoplay();
+} else requestAnimationFrame(frame);
